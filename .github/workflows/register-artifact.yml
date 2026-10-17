@@ -1,0 +1,242 @@
+# MIRROR of braunedwards/Pedestal/.github/workflows/register-artifact.yml.
+# Hosted-app repos call this copy because Pedestal's repository is private and its Actions cannot be
+# shared across owners. Pedestal validates only the OIDC audience and the 'repository' claim, so the
+# copy behaves identically. Keep it in sync with the original when that changes.
+
+name: Register artifact
+
+# Reusable workflow: builds a container image, pushes it, and registers the
+# resulting immutable digest with Pedestal as an Artifact
+# (`POST /api/artifacts`, see docs/authentication.md's "Machine-to-machine:
+# GitHub Actions OIDC" section and Pedestal.Domain.Delivery.Artifact).
+#
+# This workflow's responsibility ends the moment the Artifact is
+# successfully registered. It deliberately does NOT:
+#   - accept a Pedestal environment as a deployment target
+#   - call DeployArtifact / trigger any deployment
+#   - edit Helm values or any GitOps-tracked file
+#   - edit pedestal-infra (or any other infrastructure repository)
+#   - commit a deployment tag anywhere
+#   - express any promotion/deployment intent whatsoever
+#
+# "This image, built from this commit, now exists" is the entire contract -
+# choosing to deploy it (to which environment, and when) is a separate
+# decision made in Pedestal itself, never something CI decides on its own.
+# That decision may be a person clicking Deploy, or an environment a person
+# has opted into auto-deploy for its tracking branch (see
+# docs/deployment-pipeline.md, "Auto-deploy") - either way this workflow
+# neither knows nor cares: the request body has no environment in it.
+#
+# Consuming repository requirements:
+#   - permissions: id-token: write (to mint the GitHub Actions OIDC token)
+#                  packages: write (to push to GHCR, if using the default
+#                  registry login below)
+#   - Pedestal must be configured with GitHubActionsOidc:Audience equal to
+#     the `oidc_audience` input below, and this repository must already be
+#     onboarded as a Pedestal Application (the token's `repository` claim is
+#     matched against Application.RepositoryFullName server-side - see
+#     RegisterArtifactCommand).
+#
+# Example consumer: examples/sample-app/.github/workflows/build-and-publish.yml
+
+on:
+  workflow_call:
+    inputs:
+      workload_name:
+        description: >-
+          The ArtifactSlot name this image is for (e.g. "app", "web",
+          "worker") - for a PedestalManaged application this must match a
+          WorkloadSpec already declared on its RuntimeSpec (slots are
+          created automatically alongside each workload); for a CustomHelm
+          application it must match a slot already declared via
+          DefineArtifactSlotCommand.
+        required: true
+        type: string
+      image_repository:
+        description: >-
+          Where to push the image, e.g. "ghcr.io/my-org/my-app-api". Never
+          includes a tag or digest.
+        required: true
+        type: string
+      pedestal_api_url:
+        description: >-
+          Base URL of the Pedestal instance to register this artifact with,
+          e.g. "https://pedestal.example.com" (no trailing slash).
+        required: true
+        type: string
+      oidc_audience:
+        description: >-
+          Must exactly match this Pedestal instance's configured
+          GitHubActionsOidc:Audience - see docs/authentication.md.
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile to build.
+        required: false
+        type: string
+        default: ./Dockerfile
+      context:
+        description: Docker build context.
+        required: false
+        type: string
+        default: .
+      registry:
+        description: >-
+          Container registry to log into before pushing. Defaults to GHCR
+          using the workflow's own ephemeral GITHUB_TOKEN - override (and
+          supply registry_username/registry_password) to push somewhere else.
+        required: false
+        type: string
+        default: ghcr.io
+      registry_username:
+        description: Registry username - defaults to the calling actor, only meaningful for the default GHCR login.
+        required: false
+        type: string
+        default: ${{ github.actor }}
+      build_args:
+        description: >-
+          Optional newline-separated KEY=VALUE docker build args (passed
+          straight to docker/build-push-action's build-args). Never put
+          secrets here - they end up in image history.
+        required: false
+        type: string
+        default: ''
+      version:
+        description: >-
+          Optional human version to attach to the artifact (e.g. a semver
+          tag, or the version from package.json). Purely descriptive: when
+          absent Pedestal labels the release "branch #run · sha · commit
+          subject" instead. Tag pushes are picked up automatically from the
+          ref, so this is only needed when the version lives elsewhere.
+        required: false
+        type: string
+        default: ''
+      provenance:
+        description: >-
+          Attach a BuildKit provenance attestation to the pushed image. It embeds
+          a build timestamp, so the image digest changes on every build even when
+          nothing did; set false for images that should keep their digest (and so
+          not be redeployed) while their content is unchanged.
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      registry_password:
+        description: >-
+          Registry password/token. Defaults to the workflow's own
+          GITHUB_TOKEN when unset, which is sufficient for pushing to GHCR
+          under the calling repository's own namespace.
+        required: false
+    outputs:
+      artifact_id:
+        description: The Pedestal Artifact.Id created by this registration.
+        value: ${{ jobs.build-and-register.outputs.artifact_id }}
+      image_digest:
+        description: The immutable digest of the image that was built and registered.
+        value: ${{ jobs.build-and-register.outputs.image_digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-register:
+    name: Build, push, and register artifact
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required to mint the GitHub Actions OIDC token this workflow's whole
+      # purpose depends on (see docs/authentication.md) - never used for
+      # anything else.
+      id-token: write
+      # Required only for the default GHCR push below - not needed at all
+      # if a consumer overrides `registry`/`registry_username` and supplies
+      # `registry_password` to push somewhere else with narrower permissions.
+      packages: write
+    outputs:
+      artifact_id: ${{ steps.register.outputs.artifact_id }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry_username }}
+          password: ${{ secrets.registry_password || github.token }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          # sha-<full 40-char commit sha> is unique per commit - an
+          # effectively-immutable tag purely for registry/UI browsability.
+          # The digest captured below (never this tag) is what Pedestal
+          # actually records and what the managed runtime chart deploys by -
+          # see charts/application-runtime's "application-runtime.image"
+          # helper, which always renders `repository@digest`, never a tag.
+          tags: ${{ inputs.image_repository }}:sha-${{ github.sha }}
+          build-args: ${{ inputs.build_args }}
+          provenance: ${{ inputs.provenance }}
+          cache-from: type=gha,scope=${{ inputs.workload_name }}
+          cache-to: type=gha,scope=${{ inputs.workload_name }},mode=max
+
+      - name: Register artifact with Pedestal
+        id: register
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('${{ inputs.oidc_audience }}');
+
+            // Descriptive metadata so Pedestal can label the release in human
+            // terms. The push payload carries the head commit; for other
+            // triggers (workflow_dispatch, re-runs) fall back to the API.
+            let commitMessage = context.payload?.head_commit?.message ?? null;
+            if (!commitMessage) {
+              try {
+                const { data } = await github.rest.repos.getCommit({ ...context.repo, ref: context.sha });
+                commitMessage = data.commit.message;
+              } catch (e) {
+                core.info(`Could not read commit message: ${e.message}`);
+              }
+            }
+
+            const response = await fetch('${{ inputs.pedestal_api_url }}/api/artifacts', {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                workloadName: '${{ inputs.workload_name }}',
+                imageRepository: '${{ inputs.image_repository }}',
+                imageDigest: '${{ steps.build.outputs.digest }}',
+                gitCommitSha: context.sha,
+                gitRef: context.ref,
+                commitMessage: commitMessage ? commitMessage.split('\n')[0] : null,
+                buildNumber: context.runNumber,
+                version: ${{ toJSON(inputs.version) }} || null,
+              }),
+            });
+
+            const body = await response.text();
+
+            if (!response.ok) {
+              core.setFailed(`Artifact registration failed (HTTP ${response.status}): ${body}`);
+              return;
+            }
+
+            const parsed = JSON.parse(body);
+            core.setOutput('artifact_id', parsed.artifactId);
+            core.summary
+              .addHeading('Artifact registered with Pedestal')
+              .addRaw(`- **Workload:** \`${{ inputs.workload_name }}\`\n`, true)
+              .addRaw(`- **Image digest:** \`${{ steps.build.outputs.digest }}\`\n`, true)
+              .addRaw(`- **Artifact ID:** \`${parsed.artifactId}\`\n`, true)
+              .addRaw('\nThis workflow only registered the artifact. Whether it gets deployed is decided in Pedestal: deploy it from the UI/API, or let an environment that has opted into auto-deploy for this branch pick it up.', true)
+              .write();
