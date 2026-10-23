@@ -141,7 +141,7 @@ permissions:
 jobs:
   build-and-register:
     name: Build, push, and register artifact
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     permissions:
       contents: read
       # Required to mint the GitHub Actions OIDC token this workflow's whole
