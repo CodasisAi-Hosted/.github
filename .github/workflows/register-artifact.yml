@@ -55,9 +55,11 @@ on:
       image_repository:
         description: >-
           Where to push the image, e.g. "ghcr.io/my-org/my-app-api". Never
-          includes a tag or digest.
-        required: true
+          includes a tag or digest. When empty, defaults to
+          ghcr.io/<owner>/<repo> lowercased (GHCR names must be lowercase).
+        required: false
         type: string
+        default: ''
       pedestal_api_url:
         description: >-
           Base URL of the Pedestal instance to register this artifact with,
@@ -138,6 +140,14 @@ on:
 permissions:
   contents: read
 
+# One build per repository, ref and workload at a time; a newer push waits (and replaces
+# any older waiting run). cancel-in-progress stays false on purpose: cancelling could
+# stop a run after the image push but before registration, leaving a pushed image that
+# Pedestal never heard of.
+concurrency:
+  group: register-artifact-${{ github.repository }}-${{ github.ref }}-${{ inputs.workload_name }}
+  cancel-in-progress: false
+
 jobs:
   build-and-register:
     name: Build, push, and register artifact
@@ -155,7 +165,19 @@ jobs:
     outputs:
       artifact_id: ${{ steps.register.outputs.artifact_id }}
       image_digest: ${{ steps.build.outputs.digest }}
+      image_repository: ${{ steps.image.outputs.repository }}
     steps:
+      - name: Resolve image repository
+        id: image
+        env:
+          INPUT_REPOSITORY: ${{ inputs.image_repository }}
+        run: |
+          if [ -n "$INPUT_REPOSITORY" ]; then
+            echo "repository=$INPUT_REPOSITORY" >> "$GITHUB_OUTPUT"
+          else
+            echo "repository=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
@@ -180,32 +202,37 @@ jobs:
           # actually records and what the managed runtime chart deploys by -
           # see charts/application-runtime's "application-runtime.image"
           # helper, which always renders `repository@digest`, never a tag.
-          tags: ${{ inputs.image_repository }}:sha-${{ github.sha }}
+          tags: ${{ steps.image.outputs.repository }}:sha-${{ github.sha }}
           build-args: ${{ inputs.build_args }}
           provenance: ${{ inputs.provenance }}
           cache-from: type=gha,scope=${{ inputs.workload_name }}
-          cache-to: type=gha,scope=${{ inputs.workload_name }},mode=max
+          cache-to: type=gha,scope=${{ inputs.workload_name }},mode=min
 
       - name: Register artifact with Pedestal
         id: register
         uses: actions/github-script@v7
         with:
           script: |
+            const t0 = Date.now();
             const token = await core.getIDToken('${{ inputs.oidc_audience }}');
+            core.info(`getIDToken took ${Date.now() - t0} ms`);
 
             // Descriptive metadata so Pedestal can label the release in human
             // terms. The push payload carries the head commit; for other
             // triggers (workflow_dispatch, re-runs) fall back to the API.
             let commitMessage = context.payload?.head_commit?.message ?? null;
             if (!commitMessage) {
+              const t1 = Date.now();
               try {
                 const { data } = await github.rest.repos.getCommit({ ...context.repo, ref: context.sha });
                 commitMessage = data.commit.message;
               } catch (e) {
                 core.info(`Could not read commit message: ${e.message}`);
               }
+              core.info(`getCommit took ${Date.now() - t1} ms`);
             }
 
+            const t2 = Date.now();
             const response = await fetch('${{ inputs.pedestal_api_url }}/api/artifacts', {
               method: 'POST',
               headers: {
@@ -214,7 +241,7 @@ jobs:
               },
               body: JSON.stringify({
                 workloadName: '${{ inputs.workload_name }}',
-                imageRepository: '${{ inputs.image_repository }}',
+                imageRepository: '${{ steps.image.outputs.repository }}',
                 imageDigest: '${{ steps.build.outputs.digest }}',
                 gitCommitSha: context.sha,
                 gitRef: context.ref,
@@ -225,6 +252,7 @@ jobs:
             });
 
             const body = await response.text();
+            core.info(`POST /api/artifacts took ${Date.now() - t2} ms, HTTP ${response.status}`);
 
             if (!response.ok) {
               core.setFailed(`Artifact registration failed (HTTP ${response.status}): ${body}`);
