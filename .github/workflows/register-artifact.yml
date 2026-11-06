@@ -151,7 +151,7 @@ concurrency:
 jobs:
   build-and-register:
     name: Build, push, and register artifact
-    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ vars.CI_RUNNER || 'do-ephemeral' }}
     permissions:
       contents: read
       # Required to mint the GitHub Actions OIDC token this workflow's whole
